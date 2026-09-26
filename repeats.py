@@ -1,4 +1,4 @@
-"""反复段解析与展开核心逻辑：展开、排练时间轴、节拍点查询与排练片段定位。
+"""反复段解析与展开核心逻辑：展开、排练时间轴、节拍点查询、排练片段定位与提前提示单。
 
 输入格式（逐行）：
     [|:]小节编号[:|xN][拍数@BPM]
@@ -15,6 +15,7 @@
   遇到下一处原谱显式速度或下一条临时变速时重新切换
 """
 
+import bisect
 import math
 import re
 import struct
@@ -436,6 +437,74 @@ def beats_in_window(root, start_ms, end_ms,
         # 整小节在窗口之前时按小节跨度跳过，不逐拍展开
         elapsed += duration
     return beats, None
+
+
+def advance_cues(root, target_num, target_beat, lead_beats,
+                 measure_limit=MAX_MEASURES, tempo_map=None):
+    """生成提前提示单：目标拍在每次实际演奏中的目标时间、提示时间与提示位置。
+
+    目标拍为原谱小节 target_num 的第 target_beat 拍（从 1 开始）；提示拍按
+    反复展开后的全曲拍点顺序从目标拍向前数 lead_beats 拍，可跨小节、反复回跳
+    与变速边界。提示时间与目标时间均按速度轨迹（含临时变速）的未取整累计时间
+    计算，展示毫秒按 _round_ms 取整，不按固定毫秒回推。
+
+    返回 (cues, error)：
+    - cues  为 [{"seq": 目标拍所在小节的演奏序号, "target_ms": 目标时间毫秒,
+                  "cue": 是否可提前提示, "cue_ms": 提示时间毫秒或 None,
+                  "cue_seq": 提示所在演奏序号或 None}, ...]；
+      曲首之前拍点不足（提示拍落在曲首之前）的轮次 cue 为 False，
+      其余轮次照常返回
+    - error 为 None，或 {"kind": "measures", "node": 导致停止的小节节点}
+      （展开超过 measure_limit），或 {"kind": "target", "message": 错误描述}
+      （目标小节不存在或目标拍序超出该小节拍数）
+    """
+    source = None
+    for node in _iter_source_measures(root):
+        if node["num"] == target_num:
+            source = node
+            break
+    if source is None:
+        return None, {"kind": "target",
+                      "message": f"目标小节编号 {target_num} 在源谱中不存在"}
+    if target_beat > source["beats"]:
+        return None, {"kind": "target",
+                      "message": (f"目标拍序 {target_beat} 超出小节 {target_num} "
+                                  f"的拍数（{source['beats']} 拍）")}
+
+    cues = []
+    starts = []    # 各演奏小节的起始全曲拍点下标（从 0 开始），供二分定位提示拍
+    spans = []     # 各演奏小节的 (起始下标, 演奏序号, 起始毫秒, 每拍毫秒)
+    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    index = 0      # 当前小节的起始全曲拍点下标
+    for node, seq, bpm, _origin in _iter_playback(root, tempo_map):
+        if seq > measure_limit:
+            return None, {"kind": "measures", "node": node}
+        beat_len = 60000 / bpm  # 每拍时长（毫秒）
+        starts.append(index)
+        spans.append((index, seq, elapsed, beat_len))
+        if node["num"] == target_num:
+            cue_index = index + target_beat - 1 - lead_beats
+            row = {
+                "seq": seq,
+                "target_ms": _round_ms(elapsed + (target_beat - 1) * beat_len),
+            }
+            if cue_index < 0:
+                # 曲首之前拍点不足，本轮无法提前提示
+                row.update({"cue": False, "cue_ms": None, "cue_seq": None})
+            else:
+                # 提示拍必在当前小节或之前，二分定位其所在演奏小节
+                pos = bisect.bisect_right(starts, cue_index) - 1
+                m_index, m_seq, m_start, m_beat_len = spans[pos]
+                row.update({
+                    "cue": True,
+                    "cue_ms": _round_ms(
+                        m_start + (cue_index - m_index) * m_beat_len),
+                    "cue_seq": m_seq,
+                })
+            cues.append(row)
+        elapsed += node["beats"] * beat_len
+        index += node["beats"]
+    return cues, None
 
 
 def _bpm_to_us_per_beat(bpm):

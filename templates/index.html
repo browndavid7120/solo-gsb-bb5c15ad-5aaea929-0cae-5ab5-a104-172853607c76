@@ -46,7 +46,7 @@
     background: #ffebe9; border: 1px solid #ffb3ad; border-radius: 8px;
     color: #a40e26; font-size: 14px; line-height: 1.8;
   }
-  #summary, #beatSummary, #segmentSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  #summary, #beatSummary, #segmentSummary, #cueSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
   #metroStatus { font-size: 14px; color: #57606a; align-self: center; }
   table {
     width: 100%; border-collapse: collapse; background: #fff;
@@ -76,7 +76,7 @@
   <textarea id="input" rows="12" spellcheck="false"
     placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
   <p class="hint">
-    临时变速（可选）：每行一条 <code>演奏序号=BPM</code>，展开与拍点查询共用。
+    临时变速（可选）：每行一条 <code>演奏序号=BPM</code>，展开、拍点查询、片段定位与提前提示单共用。
     演奏序号按反复展开后的实际轮次计数，BPM 为正整数；演奏到该轮次时临时速度优先于
     该小节原谱速度，并沿用至后续未标速小节，遇到下一处原谱显式速度或下一条临时变速时重新切换。
     序号重复、超出展开范围或格式错误时会指出方案内的行号。
@@ -149,6 +149,28 @@
     </thead>
     <tbody></tbody>
   </table>
+
+  <h2>提前提示单</h2>
+  <p class="hint">
+    输入目标原谱小节编号、目标拍序与提前拍数，列出该拍在每次实际演奏中的
+    演奏序号、目标时间、提示时间及提示所在演奏序号。
+    提示按反复展开后的全曲拍点顺序从目标拍向前数，可跨小节、反复回跳和变速边界；
+    时间沿用临时变速与毫秒取整规则，不按固定毫秒回推。
+    目标拍序超出该小节拍数时报错；曲首之前拍点不足的轮次会标明无法提前提示，其余轮次照常列出。
+  </p>
+  <div class="toolbar">
+    <input id="cueNum" type="number" min="0" step="1" placeholder="目标原谱小节编号">
+    <input id="cueBeat" type="number" min="1" step="1" placeholder="目标拍序">
+    <input id="cueAdvance" type="number" min="1" step="1" placeholder="提前拍数">
+    <button id="cuesBtn" class="primary">生成提示单</button>
+  </div>
+  <p id="cueSummary"></p>
+  <table id="cueResult" hidden>
+    <thead>
+      <tr><th>演奏序号</th><th>目标时间(毫秒)</th><th>提示时间(毫秒)</th><th>提示所在演奏序号</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
 <script>
@@ -177,6 +199,10 @@ for (const id of ["startMs", "endMs"]) {
 $("segmentsBtn").addEventListener("click", doSegmentQuery);
 for (const id of ["startNum", "endNum"]) {
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doSegmentQuery(); });
+}
+$("cuesBtn").addEventListener("click", doCueQuery);
+for (const id of ["cueNum", "cueBeat", "cueAdvance"]) {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doCueQuery(); });
 }
 
 // ---- 实时节拍器 ----
@@ -383,6 +409,7 @@ function reset() {
   resetExpand();
   resetBeats();
   resetSegments();
+  resetCues();
 }
 
 function resetExpand() {
@@ -403,6 +430,12 @@ function resetSegments() {
   $("segmentSummary").textContent = "";
   $("segmentResult").hidden = true;
   $("segmentResult").querySelector("tbody").innerHTML = "";
+}
+
+function resetCues() {
+  $("cueSummary").textContent = "";
+  $("cueResult").hidden = true;
+  $("cueResult").querySelector("tbody").innerHTML = "";
 }
 
 async function doExpand() {
@@ -548,6 +581,55 @@ async function doSegmentQuery() {
   }
   tbody.appendChild(frag);
   $("segmentResult").hidden = false;
+}
+
+async function doCueQuery() {
+  $("errors").innerHTML = "";
+  resetCues();
+  // 空值或非数字（NaN 经 JSON 序列化也为 null）交由服务端校验
+  const toNum = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  let data;
+  try {
+    const resp = await fetch("/api/cues", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        num: toNum("cueNum"),
+        beat: toNum("cueBeat"),
+        advance: toNum("cueAdvance"),
+        tempo: $("tempo").value,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  const unable = data.cues.filter((c) => !c.able).length;
+  $("cueSummary").textContent = unable
+    ? `目标拍共演奏 ${data.count} 次，其中 ${unable} 次因曲首之前拍点不足无法提前提示`
+    : `目标拍共演奏 ${data.count} 次`;
+  const tbody = $("cueResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const c of data.cues) {
+    const tr = document.createElement("tr");
+    for (const v of [c.seq, c.target_ms, c.able ? c.cue_ms : "无法提前提示", c.able ? c.cue_seq : "—"]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("cueResult").hidden = false;
 }
 
 function downloadCsv() {

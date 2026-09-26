@@ -6,8 +6,9 @@ import os
 from flask import Flask, Response, jsonify, render_template, request
 
 from repeats import (
-    MAX_BEATS, MAX_MEASURES, MAX_TOTAL_BEATS, beats_in_window, build_midi,
-    expand, match_segments, parse, parse_tempo_map, source_range_pattern,
+    MAX_BEATS, MAX_MEASURES, MAX_TOTAL_BEATS, advance_cues, beats_in_window,
+    build_midi, expand, match_segments, parse, parse_tempo_map,
+    source_range_pattern,
 )
 
 app = Flask(__name__)
@@ -62,6 +63,20 @@ def _parse_measure_number(data, key, label):
         value = int(value)
     if value < 0:
         return None, f"{label}小节编号必须是非负整数"
+    return value, None
+
+
+def _parse_positive_int(data, key, label):
+    """校验正整数参数（拍序、提前拍数），返回 (值, 错误描述)；通过时错误描述为 None。"""
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, f"{label}必须是正整数"
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            return None, f"{label}必须是正整数"
+        value = int(value)
+    if value < 1:
+        return None, f"{label}必须是正整数"
     return value, None
 
 
@@ -224,6 +239,58 @@ def api_segments():
         "pattern": pattern,
         "segments": segments,
     })
+
+
+@app.post("/api/cues")
+def api_cues():
+    data = request.get_json(silent=True) or {}
+    text = data.get("input", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({
+            "ok": False,
+            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
+        })
+
+    root, errors = parse(text)
+    if errors:
+        return jsonify({"ok": False, "errors": errors})
+
+    num, err = _parse_measure_number(data, "num", "目标")
+    if err is not None:
+        return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+    beat, err = _parse_positive_int(data, "beat", "目标拍序")
+    if err is not None:
+        return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+    advance, err = _parse_positive_int(data, "advance", "提前拍数")
+    if err is not None:
+        return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+
+    # 与展开接口一致：先展开一次取得总小节数以校验临时变速序号范围
+    rows, overflow = expand(root)
+    if overflow is not None:
+        return jsonify({
+            "ok": False,
+            "overflow": True,
+            "errors": [_measure_overflow_error(overflow)],
+        })
+    tempo_map, tempo_errors = _parse_tempo(data, len(rows))
+    if tempo_errors:
+        return jsonify({"ok": False, "errors": tempo_errors})
+
+    cues, error = advance_cues(root, num, beat, advance, tempo_map=tempo_map)
+    if error is not None:
+        if "node" in error:
+            return jsonify({
+                "ok": False,
+                "overflow": True,
+                "errors": [_measure_overflow_error(error["node"])],
+            })
+        return jsonify({
+            "ok": False,
+            "errors": [{"line": None, "message": error["message"]}],
+        })
+
+    return jsonify({"ok": True, "count": len(cues), "cues": cues})
 
 
 def _midi_error_entry(error):

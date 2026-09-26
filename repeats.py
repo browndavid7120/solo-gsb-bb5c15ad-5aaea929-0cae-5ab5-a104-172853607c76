@@ -1,4 +1,4 @@
-"""反复段解析与展开核心逻辑：展开、排练时间轴、节拍点查询与排练片段定位。
+"""反复段解析与展开核心逻辑：展开、排练时间轴、节拍点查询、排练片段定位与提前提示单。
 
 输入格式（逐行）：
     [|:]小节编号[:|xN][拍数@BPM]
@@ -15,6 +15,7 @@
   遇到下一处原谱显式速度或下一条临时变速时重新切换
 """
 
+import bisect
 import math
 import re
 import struct
@@ -436,6 +437,79 @@ def beats_in_window(root, start_ms, end_ms,
         # 整小节在窗口之前时按小节跨度跳过，不逐拍展开
         elapsed += duration
     return beats, None
+
+
+def advance_cues(root, target_num, target_beat, advance,
+                 measure_limit=MAX_MEASURES, tempo_map=None):
+    """为“提前提示单”计算目标拍在每次实际演奏中的提示点。
+
+    目标拍为源谱编号 target_num 的小节的第 target_beat 拍；提示点按反复展开后的
+    全曲拍点顺序从目标拍向前数 advance 拍（可跨小节、反复回跳和变速边界）。
+    时间沿用与展开、拍点查询相同的速度轨迹（含临时变速 tempo_map）与毫秒取整规则：
+    累计时保留精度，展示毫秒四舍五入到最近毫秒，不按固定毫秒回推。
+
+    返回 (cues, error)：
+    - cues  为 [{"seq": 目标拍所在演奏序号, "target_ms": 目标时间,
+                  "cue_ms": 提示时间, "cue_seq": 提示所在演奏序号,
+                  "able": 是否可提前提示}, ...]；
+      曲首之前拍点不足（目标拍之前不足 advance 拍）的轮次 able 为 False，
+      cue_ms 与 cue_seq 为 None，其余轮次仍正常返回
+    - error 为 None；或 {"message": 错误描述}
+      （目标小节不存在、目标拍序超出该小节拍数）；
+      或 {"kind": "measures", "node": 小节节点}（展开超过 measure_limit）
+    """
+    # 目标小节的拍数是源谱属性，先在源谱中定位并校验目标拍序
+    src_beats = None
+    for node in _iter_source_measures(root):
+        if node["num"] == target_num:
+            src_beats = node["beats"]
+            break
+    if src_beats is None:
+        return None, {"message": f"目标小节编号 {target_num} 在源谱中不存在"}
+    if target_beat > src_beats:
+        return None, {"message": (
+            f"目标拍序 {target_beat} 超出小节 {target_num} 的拍数"
+            f"（{src_beats} 拍）"
+        )}
+
+    # 按演奏顺序记录每个小节的拍点起点：(起始累计拍数, 起始毫秒(未取整), 每拍毫秒, 演奏序号)
+    measures = []
+    targets = []  # 目标小节各轮次在 measures 中的下标
+    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    cum = 0  # 已累计的拍数
+    for node, seq, bpm, _origin in _iter_playback(root, tempo_map):
+        if seq > measure_limit:
+            return None, {"kind": "measures", "node": node}
+        beat_len = 60000 / bpm
+        if node["num"] == target_num:
+            targets.append(len(measures))
+        measures.append((cum, elapsed, beat_len, seq))
+        elapsed += node["beats"] * beat_len
+        cum += node["beats"]
+
+    starts = [m[0] for m in measures]  # 各小节起始累计拍数，用于二分定位提示拍
+    cues = []
+    for idx in targets:
+        cum0, el0, bl0, seq = measures[idx]
+        target_ms = _round_ms(el0 + (target_beat - 1) * bl0)
+        # 提示拍的全曲拍点下标：从目标拍向前数 advance 拍
+        g = cum0 + (target_beat - 1) - advance
+        if g < 0:
+            cues.append({
+                "seq": seq, "target_ms": target_ms,
+                "cue_ms": None, "cue_seq": None, "able": False,
+            })
+            continue
+        # 起始累计拍数不超过 g 的最后一个小节即提示拍所在小节
+        cum1, el1, bl1, cue_seq = measures[bisect.bisect_right(starts, g) - 1]
+        cues.append({
+            "seq": seq,
+            "target_ms": target_ms,
+            "cue_ms": _round_ms(el1 + (g - cum1) * bl1),
+            "cue_seq": cue_seq,
+            "able": True,
+        })
+    return cues, None
 
 
 def _bpm_to_us_per_beat(bpm):
